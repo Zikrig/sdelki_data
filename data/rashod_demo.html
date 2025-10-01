@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Расходная накладная</title>
+    <style>
+        @font-face {
+            font-family: 'DejaVuSans';
+            src: url('file:///usr/share/fonts/truetype/dejavu/DejaVuSans.ttf');
+        }
+        body {
+            font-family: 'DejaVuSans', sans-serif;
+            margin: 20px;
+            line-height: 1.4;
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 20px;
+        }
+        .invoice-title {
+            font-size: 18px;
+            font-weight: bold;
+            margin-bottom: 10px;
+        }
+        .company-info {
+            margin-bottom: 20px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-bottom: 20px;
+        }
+        th, td {
+            border: 1px solid #000;
+            padding: 8px;
+            text-align: left;
+        }
+        th {
+            background-color: #f2f2f2;
+        }
+        .totals {
+            margin-bottom: 30px;
+        }
+        .signatures {
+            display: flex;
+            justify-content: space-between;
+            margin-top: 50px;
+        }
+        .signature-block {
+            width: 45%;
+        }
+        .protocol {
+            margin-bottom: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="invoice-title">Расходная накладная № [Number] от [Data]</div>
+    </div>
+
+    <div class="company-info">
+        <p><strong>Поставщик:</strong> ООО Изобилие</p>
+        <p><strong>Покупатель:</strong> [Kontr]</p>
+        <p><strong>Склад:</strong> Основной склад</p>
+    </div>
+
+    <table>
+        <thead>
+            <tr>
+                <th>№ п.п.</th>
+                <th>Наименование</th>
+                <th>Ед. изм.</th>
+                <th>Цена</th>
+                <th>Кол-во</th>
+                <th>Сумма</th>
+            </tr>
+        </thead>
+        <tbody>
+            [ItemsRows]
+        </tbody>
+    </table>
+
+    <div class="totals">
+        <p><strong>Итого</strong></p>
+        <p>[Sum]</p>
+        <p>Всего наименований [ItemsCount], на сумму [Sum] руб</p>
+        <p>[SumPr]</p>
+    </div>
+
+    <div class="signatures">
+        <div class="signature-block">
+            <p>Отпустил</p>
+            <p style="margin-top: 50px;">_________________________</p>
+        </div>
+        <div class="signature-block">
+            <p>Получил</p>
+            <p style="margin-top: 50px;">_________________________</p>
+        </div>
+    </div>
+</body>
+</html>
