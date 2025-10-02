@@ -170,6 +170,78 @@ def _get_this_month_period() -> tuple[datetime, datetime]:
     return start, end
 
 
+async def get_product_stock(product_id: int) -> Decimal:
+    """Возвращает текущий остаток товара"""
+    receipt_subq = (
+        select(
+            ReceiptItem.product_id.label("product_id"),
+            func.coalesce(func.sum(ReceiptItem.quantity), 0).label("total_receipt"),
+        )
+        .where(ReceiptItem.product_id == product_id)
+        .group_by(ReceiptItem.product_id)
+        .subquery()
+    )
+
+    shipment_subq = (
+        select(
+            ShipmentItem.product_id.label("product_id"),
+            func.coalesce(func.sum(ShipmentItem.quantity), 0).label("total_shipment"),
+        )
+        .where(ShipmentItem.product_id == product_id)
+        .group_by(ShipmentItem.product_id)
+        .subquery()
+    )
+
+    stmt = (
+        select(
+            func.coalesce(receipt_subq.c.total_receipt, 0) - func.coalesce(shipment_subq.c.total_shipment, 0),
+        )
+        .select_from(receipt_subq)
+        .join(shipment_subq, shipment_subq.c.product_id == receipt_subq.c.product_id, isouter=True)
+    )
+
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(stmt)
+        balance = result.scalar()
+        return Decimal(balance or 0)
+
+
+async def get_average_purchase_price(product_id: int) -> int:
+    """Возвращает среднюю закупочную цену за килограмм по всем предыдущим продажам продукта (в копейках)"""
+    async with AsyncSessionLocal() as session:
+        # Получаем все продажи этого товара с закупочными ценами
+        stmt = (
+            select(
+                ShipmentItem.quantity,
+                ShipmentItem.purchase_price_cents,
+            )
+            .where(ShipmentItem.product_id == product_id)
+            .where(ShipmentItem.purchase_price_cents > 0)  # Исключаем записи с нулевой ценой
+        )
+        
+        result = await session.execute(stmt)
+        rows = result.all()
+        
+        if not rows:
+            # Если нет продаж, возвращаем цену из справочника товара
+            product = (await session.execute(select(Product.purchase_price_cents).where(Product.id == product_id))).scalar_one_or_none()
+            return product or 0
+        
+        # Рассчитываем средневзвешенную цену
+        total_weighted_price = 0
+        total_quantity = 0
+        
+        for quantity, price_cents in rows:
+            total_weighted_price += float(quantity) * price_cents
+            total_quantity += float(quantity)
+        
+        if total_quantity == 0:
+            return 0
+        
+        average_price = total_weighted_price / total_quantity
+        return int(average_price)
+
+
 @router.callback_query(SalesExportStates.selecting_period, F.data == "period_today")
 async def period_today(call: CallbackQuery, state: FSMContext):
     start_dt, end_dt = _get_today_period()

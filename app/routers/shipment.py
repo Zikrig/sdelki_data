@@ -14,6 +14,7 @@ from ..db import AsyncSessionLocal
 from ..keyboards import list_buttons, main_menu_kb
 from ..models import Counterparty, Product, Shipment, ShipmentItem, Constants
 from ..services.pdf import ShipmentPdfData, ShipmentItemData, build_shipment_pdf, build_shipment_form_pdf
+from ..services.pdf import format_quantity
 
 
 router = Router(name="shipment")
@@ -26,6 +27,7 @@ class ShipmentStates(StatesGroup):
     waiting_price = State()
     waiting_new_price = State()
     confirming_add_more = State()
+    stock_insufficient = State()
 
 
 @router.callback_query(F.data == "start_shipment")
@@ -95,31 +97,67 @@ async def input_quantity(message: Message, state: FSMContext):
     except Exception:
         await message.answer("Некорректное количество. Введите положительное число.")
         return
+    
+    # Проверяем остатки
+    data = await state.get_data()
+    product_id = int(data["current_product_id"])  # type: ignore[index]
+    
+    # Импортируем функцию проверки остатков
+    from ..routers.reports import get_product_stock
+    
+    current_stock = await get_product_stock(product_id)
+    
+    if qty > current_stock:
+        # Недостаточно остатков
+        await state.update_data(requested_quantity=str(qty))
+        await state.set_state(ShipmentStates.stock_insufficient)
+        
+        buttons = [
+            ("Указать другое число", "enter_different_qty"),
+        ]
+        
+        # Добавляем кнопку "отпустить {остаток}" если остаток больше 0
+        if current_stock > 0:
+            buttons.append((f"Отпустить {format_quantity(current_stock)}", f"use_stock_qty:{current_stock}"))
+        
+        buttons.append(("⬅️ Назад", "back_to_product"))
+        
+        await message.answer(
+            f"Недостаточно остатков!\n"
+            f"Запрошено: {format_quantity(qty)}\n"
+            f"Доступно: {format_quantity(current_stock)}\n\n"
+            f"Выберите действие:",
+            reply_markup=list_buttons(buttons, columns=1)
+        )
+        return
+    
+    # Остатков достаточно, продолжаем как обычно
     await state.update_data(current_quantity=str(qty))
     
     # Получаем прошлую цену для этого товара и контрагента
-    data = await state.get_data()
-    product_id = int(data["current_product_id"])  # type: ignore[index]
     counterparty_id = int(data["counterparty_id"])  # type: ignore[index]
     
     async with AsyncSessionLocal() as session:
         from sqlalchemy import desc
-        last_shipment = (
+        # Получаем последнюю цену продажи напрямую из запроса
+        last_price_result = (
             await session.execute(
-                select(Shipment)
-                .join(Shipment.items)
-                .where(Shipment.counterparty_id == counterparty_id, ShipmentItem.product_id == product_id)
+                select(ShipmentItem.sale_price_cents)
+                .join(Shipment)
+                .where(
+                    Shipment.counterparty_id == counterparty_id, 
+                    ShipmentItem.product_id == product_id
+                )
                 .order_by(desc(Shipment.id))
                 .limit(1)
             )
         ).scalar_one_or_none()
         
-        if last_shipment and last_shipment.items:
-            last_price_cents = last_shipment.items[0].sale_price_cents
-            last_price_rub = last_price_cents / 100
+        if last_price_result:
+            last_price_rub = last_price_result / 100
             price_text = f"Последняя цена: {last_price_rub:.2f} ₽"
             buttons = [
-                ("Использовать прошлую цену", f"use_last_price:{last_price_cents}"),
+                ("Использовать прошлую цену", f"use_last_price:{last_price_result}"),
                 ("Ввести новую цену", "enter_new_price"),
             ]
         else:
@@ -135,7 +173,7 @@ async def input_quantity(message: Message, state: FSMContext):
     await state.set_state(ShipmentStates.waiting_price)
     await message.answer(
         f"{price_text}\n\nВыберите действие:",
-        reply_markup=list_buttons(buttons, columns=1)
+        reply_markup=list_buttons(buttons, columns=1, back="back_to_product")
     )
 
 
@@ -148,6 +186,29 @@ async def use_last_price(call: CallbackQuery, state: FSMContext):
 async def enter_new_price(call: CallbackQuery, state: FSMContext):
     await state.set_state(ShipmentStates.waiting_new_price)
     await call.message.edit_text("Введите новую цену в рублях (можно с точкой):")
+    await call.answer()
+
+
+@router.callback_query(ShipmentStates.waiting_price, F.data == "back_to_product")
+async def back_to_product_from_price(call: CallbackQuery, state: FSMContext):
+    # Возвращаемся к выбору товара
+    await state.set_state(ShipmentStates.waiting_product)
+    
+    async with AsyncSessionLocal() as session:
+        products = (await session.execute(select(Product).order_by(Product.name))).scalars().all()
+    
+    if not products:
+        await call.message.edit_text("Нет товаров в базе.", reply_markup=main_menu_kb())
+        await call.answer()
+        return
+    
+    buttons = [(f"{p.code} {p.name}", f"p:{p.id}") for p in products]
+    buttons.append(("🏠 Главное меню", "main"))
+    
+    await call.message.edit_text(
+        "Выберите товар:",
+        reply_markup=list_buttons(buttons, columns=1)
+    )
     await call.answer()
 
 @router.message(ShipmentStates.waiting_new_price)
@@ -170,8 +231,14 @@ async def process_price_selection(message_or_call, state: FSMContext, price_cent
     quantity = Decimal(data["current_quantity"])  # type: ignore[index]
     counterparty_id = int(data["counterparty_id"])  # type: ignore[index]
 
+    # Импортируем функцию расчета средней закупочной цены
+    from ..routers.reports import get_average_purchase_price
+
     async with AsyncSessionLocal() as session:
         product = (await session.execute(select(Product).where(Product.id == product_id))).scalar_one()
+        
+        # Получаем среднюю закупочную цену по продажам
+        average_purchase_price = await get_average_purchase_price(product_id)
 
         item = ShipmentItemData(
             line_number=len(data.get("items", [])) + 1,  # type: ignore[arg-type]
@@ -179,7 +246,7 @@ async def process_price_selection(message_or_call, state: FSMContext, price_cent
             product_code=product.code,
             quantity=quantity,
             sale_price_cents=price_cents,
-            purchase_price_cents=product.purchase_price_cents,
+            purchase_price_cents=average_purchase_price,
         )
 
     items = data.get("items", [])  # type: ignore[assignment]
@@ -203,6 +270,7 @@ async def process_price_selection(message_or_call, state: FSMContext, price_cent
             reply_markup=list_buttons([
                 ("Добавить ещё", "add_more"),
                 ("Завершить", "finish_shipment"),
+                ("⬅️ Назад", "back_to_product"),
             ], columns=1),
         )
     else:
@@ -211,6 +279,7 @@ async def process_price_selection(message_or_call, state: FSMContext, price_cent
             reply_markup=list_buttons([
                 ("Добавить ещё", "add_more"),
                 ("Завершить", "finish_shipment"),
+                ("⬅️ Назад", "back_to_product"),
             ], columns=1),
         )
         await message_or_call.answer()
@@ -234,6 +303,29 @@ async def add_more_items(call: CallbackQuery, state: FSMContext):
     except TelegramBadRequest:
         await call.answer("Меню уже отображается", show_alert=False)
         return
+    await call.answer()
+
+
+@router.callback_query(ShipmentStates.confirming_add_more, F.data == "back_to_product")
+async def back_to_product_from_confirm(call: CallbackQuery, state: FSMContext):
+    # Возвращаемся к выбору товара
+    await state.set_state(ShipmentStates.waiting_product)
+    
+    async with AsyncSessionLocal() as session:
+        products = (await session.execute(select(Product).order_by(Product.name))).scalars().all()
+    
+    if not products:
+        await call.message.edit_text("Нет товаров в базе.", reply_markup=main_menu_kb())
+        await call.answer()
+        return
+    
+    buttons = [(f"{p.code} {p.name}", f"p:{p.id}") for p in products]
+    buttons.append(("🏠 Главное меню", "main"))
+    
+    await call.message.edit_text(
+        "Выберите товар:",
+        reply_markup=list_buttons(buttons, columns=1)
+    )
     await call.answer()
 
 
@@ -346,6 +438,87 @@ async def finish_shipment(call: CallbackQuery, state: FSMContext):
     )
 
     await state.clear()
+    await call.answer()
+
+
+@router.callback_query(ShipmentStates.stock_insufficient, F.data == "enter_different_qty")
+async def enter_different_qty(call: CallbackQuery, state: FSMContext):
+    await state.set_state(ShipmentStates.waiting_qty)
+    await call.message.edit_text("Укажите количество (число, можно с точкой):", reply_markup=None)
+    await call.answer()
+
+
+@router.callback_query(ShipmentStates.stock_insufficient, F.data.startswith("use_stock_qty:"))
+async def use_stock_qty(call: CallbackQuery, state: FSMContext):
+    stock_qty = Decimal(call.data.split(":", 1)[1])
+    await state.update_data(current_quantity=str(stock_qty))
+    
+    # Получаем данные для продолжения с ценой
+    data = await state.get_data()
+    product_id = int(data["current_product_id"])  # type: ignore[index]
+    counterparty_id = int(data["counterparty_id"])  # type: ignore[index]
+    
+    async with AsyncSessionLocal() as session:
+        from sqlalchemy import desc
+        # Получаем последнюю цену продажи напрямую из запроса
+        last_price_result = (
+            await session.execute(
+                select(ShipmentItem.sale_price_cents)
+                .join(Shipment)
+                .where(
+                    Shipment.counterparty_id == counterparty_id, 
+                    ShipmentItem.product_id == product_id
+                )
+                .order_by(desc(Shipment.id))
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        
+        if last_price_result:
+            last_price_rub = last_price_result / 100
+            price_text = f"Последняя цена: {last_price_rub:.2f} ₽"
+            buttons = [
+                ("Использовать прошлую цену", f"use_last_price:{last_price_result}"),
+                ("Ввести новую цену", "enter_new_price"),
+            ]
+        else:
+            product = (await session.execute(select(Product).where(Product.id == product_id))).scalar_one()
+            default_price_cents = product.retail_price_cents
+            default_price_rub = default_price_cents / 100
+            price_text = f"Розничная цена: {default_price_rub:.2f} ₽"
+            buttons = [
+                ("Использовать розничную цену", f"use_last_price:{default_price_cents}"),
+                ("Ввести новую цену", "enter_new_price"),
+            ]
+    
+    await state.set_state(ShipmentStates.waiting_price)
+    await call.message.edit_text(
+        f"{price_text}\n\nВыберите действие:",
+        reply_markup=list_buttons(buttons, columns=1)
+    )
+    await call.answer()
+
+
+@router.callback_query(ShipmentStates.stock_insufficient, F.data == "back_to_product")
+async def back_to_product(call: CallbackQuery, state: FSMContext):
+    # Возвращаемся к выбору товара
+    await state.set_state(ShipmentStates.waiting_product)
+    
+    async with AsyncSessionLocal() as session:
+        products = (await session.execute(select(Product).order_by(Product.name))).scalars().all()
+    
+    if not products:
+        await call.message.edit_text("Нет товаров в базе.", reply_markup=main_menu_kb())
+        await call.answer()
+        return
+    
+    buttons = [(f"{p.code} {p.name}", f"p:{p.id}") for p in products]
+    buttons.append(("🏠 Главное меню", "main"))
+    
+    await call.message.edit_text(
+        "Выберите товар:",
+        reply_markup=list_buttons(buttons, columns=1)
+    )
     await call.answer()
 
 
